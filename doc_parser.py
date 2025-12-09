@@ -3,7 +3,10 @@ import re
 from docx import Document
 from lxml import etree
 
-QUESTION_START = re.compile(r"(?i)^(question(\s*\d+)?)\b|^\d+[\.\)]")
+QUESTION_RE = re.compile(r"(?i)^question\b")
+OPTION_RE = re.compile(r"(?i)^[a-e][\.\)]\s*(.*)")  # a. text  OR  a) text
+ANSWER_RE = re.compile(r"(?i)^answer\s*key")
+ANSWER_ITEM_RE = re.compile(r"(?i)^(\d+)[\.\)]?\s*([a-e])$|^([a-e])$")
 
 W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
@@ -111,110 +114,25 @@ def to_roman(n):
     return res
 
 
+def clean_option(line):
+    """Remove leading a., a) etc."""
+    m = OPTION_RE.match(line.strip())
+    return m.group(1).strip() if m else line.strip()
+
+
 def parse_answer_key(lines):
-    """
-    Extract answer key.
-    Supports formats:
-      A
-      C
-      D
-    or:
-      1. a
-      2. c
-    """
     answers = []
-    start = None
-
-    for i, ln in enumerate(lines):
-        if re.search(r"(?i)^answer\s*key", ln):
-            start = i + 1
-            break
-
-    if start is None:
-        return answers
-
-    for ln in lines[start:]:
-        ln = ln.strip()
-        if not ln:
+    for ln in lines:
+        ln = ln.strip().lower()
+        m = ANSWER_ITEM_RE.match(ln)
+        if not m:
             continue
-
-        # Stop if new section begins
-        if re.search(r"(?i)^(type|chapter)", ln):
-            break
-
-        # Format 1: single letter per line
-        if re.fullmatch(r"[A-Ea-e]", ln):
-            answers.append(ln.lower())
-            continue
-
-        # Format 2: "1. a"
-        m = re.match(r"(\d+)[\.\)]\s*([a-eA-E])", ln)
-        if m:
-            answers.append(m.group(2).lower())
-
+        # Match formats:
+        # 1. a   => m.group(2)
+        # a     => m.group(3)
+        ans = m.group(2) or m.group(3)
+        answers.append(ans)
     return answers
-
-
-def parse_questions(lines):
-    """Parse MCQ questions + options."""
-    qs = []
-    i = 0
-    qnum = 1
-
-    while i < len(lines):
-        ln = lines[i]
-
-        # detect question start
-        if QUESTION_START.search(ln):
-            question_text = ln
-
-            # collect question body (same paragraph)
-            j = i + 1
-            q_lines = []
-            while (
-                j < len(lines)
-                and not QUESTION_START.search(lines[j])
-                and not re.search(r"(?i)^answer\s*key", lines[j])
-            ):
-                if lines[j].strip():
-                    q_lines.append(lines[j].strip())
-                j += 1
-
-            # question text = first line
-            # options = next 4 lines
-            options = q_lines[:4]
-            options = options + [""] * (4 - len(options))  # pad if needed
-
-            qs.append({"number": qnum, "question": question_text, "options": options})
-            qnum += 1
-
-            i = j
-        else:
-            i += 1
-
-    return qs
-
-
-def create_output_doc(questions, answers, out_path):
-    doc = Document()
-
-    for q in questions:
-        qnum = q["number"]
-        qtext = q["question"]
-
-        doc.add_paragraph(f"Question {qnum}) {qtext}")
-
-        opts = q["options"]
-        letters = ["a", "b", "c", "d"]
-
-        for letter, opt in zip(letters, opts):
-            doc.add_paragraph(f"{letter}. {opt}")
-
-        if qnum - 1 < len(answers):
-            doc.add_paragraph(f"Answer: {answers[qnum - 1]}")
-        doc.add_paragraph("")
-
-    doc.save(out_path)
 
 
 # extract answers with answer number and questions and options
@@ -270,18 +188,76 @@ def process_docx(path, output_path):
 
         lines.append(prefix + p.text)
 
-    # full_text = "\n".join(lines)
-    # input(full_text)
-    answers = parse_answer_key(lines)
-    questions = parse_questions(lines)
+    # Split into two sections: questions + answer key
+    try:
+        ak_index = next(i for i, ln in enumerate(lines) if ANSWER_RE.search(ln))
+    except StopIteration:
+        raise ValueError("Answer key not found")
 
-    create_output_doc(questions, answers, output_file)
-    print("Document processed and saved.")
+    question_lines = lines[:ak_index]
+    answer_lines = lines[ak_index + 1 :]
+
+    # Parse answer key
+    answers = parse_answer_key(answer_lines)
+
+    # Parse questions
+    formatted_questions = []
+    current_q = None
+    current_opts = []
+
+    for ln in question_lines:
+        if not ln.strip():
+            continue
+
+        # New question starts
+        if QUESTION_RE.search(ln):
+            if current_q:
+                # store previous question
+                formatted_questions.append((current_q, current_opts))
+            current_q = ln
+            current_opts = []
+            continue
+
+        # Option line (a., b., c., etc.)
+        if OPTION_RE.match(ln):
+            current_opts.append(clean_option(ln))
+            continue
+
+        # Option line without labels
+        if current_q:
+            current_opts.append(ln.strip())
+
+    # Store last block
+    if current_q:
+        formatted_questions.append((current_q, current_opts))
+
+    # Build output doc
+    out = Document()
+
+    for i, (qtext, opts) in enumerate(formatted_questions, start=1):
+        # Clean question text: remove "Question ..."
+        qtext_clean = re.sub(r"(?i)^question\b[\s:\-\d\.]*", "", qtext).strip()
+
+        out.add_paragraph(f"Question {i}) {qtext_clean}")
+
+        # Only take first 4 or 5 options
+        opts = opts[:5]
+
+        labels = ["a", "b", "c", "d", "e"]
+        for label, opt in zip(labels, opts):
+            out.add_paragraph(f"{label}. {opt}")
+
+        # Add answer
+        if i <= len(answers):
+            out.add_paragraph(f"Answer: {answers[i - 1]}")
+        out.add_paragraph("")
+
+    out.save(output_path)
 
 
 if __name__ == "__main__":
     input_file = "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new.docx"
     output_file = (
-        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed2.docx"
+        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed4.docx"
     )
     process_docx(input_file, output_file)
