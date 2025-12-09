@@ -3,36 +3,105 @@ import re
 from docx import Document
 from lxml import etree
 
-MCQ_HEADER_REGEX = r"\d+\.\t"
-ANSWER_PATTERN = r"(\d+)\s*[\.\:\-\)]?\s*([a-eA-E])"
+QUESTION_START = re.compile(r"(?i)^(question(\s*\d+)?)\b|^\d+[\.\)]")
 
 W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
-# ---------- Detect manual numbering ----------
-MANUAL_PATTERN = re.compile(
-    r"^([0-9]+|[a-zA-Z]|[ivxlcdmIVXLCDM]+)[\.\)\:]\s+"
-)
-
-def detect_manual_numbering(text):
+def _get_numbering_part_xml(doc):
     """
-    Returns (prefix, remaining_text) if manual numbering is found.
-    Example: "3) Hello" -> ("3)", "Hello")
+    Return an lxml element for numbering.xml (the numbering part).
     """
-    m = MANUAL_PATTERN.match(text.strip())
-    if not m:
-        return None, text
-    prefix = m.group(0).strip()
-    remaining = text[len(prefix):].strip()
-    return prefix, remaining
+    # find the part with numbering content type
+    for part in doc.part.package.parts:
+        if (
+            part.content_type
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
+        ):
+            xml_bytes = part.blob  # bytes of numbering.xml
+            return etree.fromstring(xml_bytes)
+    return None
 
 
-# ---------- Roman util ----------
+def get_level_format_from_numId(doc, numId, ilvl):
+    """
+    Given a Document, numId (string or int) and ilvl (int),
+    return (numFmt, lvlText) or (None, None) if not found.
+
+    numFmt is like 'decimal', 'lowerLetter', 'bullet', ...
+    lvlText is like '%1.', '%2)', '•', etc.
+    """
+    numId = str(numId)
+    numbering_xml = _get_numbering_part_xml(doc)
+    if numbering_xml is None:
+        return None, None
+
+    # 1) find the <w:num w:numId="..."> element
+    num_xpath = f".//w:num[@w:numId='{numId}']"
+    num_elm = numbering_xml.find(num_xpath, namespaces=W_NS)
+    if num_elm is None:
+        return None, None
+
+    # 2) get abstractNumId (value of <w:abstractNumId w:val="..."/>)
+    abs_node = num_elm.find("./w:abstractNumId", namespaces=W_NS)
+    if abs_node is None:
+        return None, None
+    abstract_num_id = abs_node.get(f"{{{W_NS['w']}}}val")
+
+    # 3) find the <w:abstractNum w:abstractNumId="..."> element
+    abs_xpath = f".//w:abstractNum[@w:abstractNumId='{abstract_num_id}']"
+    abs_elm = numbering_xml.find(abs_xpath, namespaces=W_NS)
+    if abs_elm is None:
+        return None, None
+
+    # 4) find the <w:lvl w:ilvl="..."> element inside abstractNum
+    lvl_xpath = f"./w:lvl[@w:ilvl='{ilvl}']"
+    lvl_elm = abs_elm.find(lvl_xpath, namespaces=W_NS)
+    if lvl_elm is None:
+        return None, None
+
+    # 5) numFmt and lvlText children
+    numFmt_elm = lvl_elm.find("./w:numFmt", namespaces=W_NS)
+    lvlText_elm = lvl_elm.find("./w:lvlText", namespaces=W_NS)
+
+    numFmt = numFmt_elm.get(f"{{{W_NS['w']}}}val") if numFmt_elm is not None else None
+    lvlText = (
+        lvlText_elm.get(f"{{{W_NS['w']}}}val") if lvlText_elm is not None else None
+    )
+
+    return numFmt, lvlText
+
+
+def convert_level_to_number(n, fmt):
+    """Convert 1 → 1, a, i depending on numFormat"""
+    if fmt == "decimal":
+        return str(n)
+    if fmt == "lowerLetter":
+        return chr(ord("a") + (n - 1))
+    if fmt == "upperLetter":
+        return chr(ord("A") + (n - 1))
+    if fmt == "lowerRoman":
+        return to_roman(n).lower()
+    if fmt == "upperRoman":
+        return to_roman(n)
+    return str(n)
+
+
 def to_roman(n):
     vals = [
-        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
-        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
-        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
     ]
     res = ""
     for v, r in vals:
@@ -42,62 +111,110 @@ def to_roman(n):
     return res
 
 
-# ---------- Convert Word numbering format ----------
-def convert_level_to_number(n, fmt):
-    if fmt in (None, 'decimal'):
-        return str(n)
-    if fmt == 'lowerLetter':
-        return chr(ord('a') + (n - 1))
-    if fmt == 'upperLetter':
-        return chr(ord('A') + (n - 1))
-    if fmt == 'lowerRoman':
-        return to_roman(n).lower()
-    if fmt == 'upperRoman':
-        return to_roman(n)
-    return str(n)
+def parse_answer_key(lines):
+    """
+    Extract answer key.
+    Supports formats:
+      A
+      C
+      D
+    or:
+      1. a
+      2. c
+    """
+    answers = []
+    start = None
+
+    for i, ln in enumerate(lines):
+        if re.search(r"(?i)^answer\s*key", ln):
+            start = i + 1
+            break
+
+    if start is None:
+        return answers
+
+    for ln in lines[start:]:
+        ln = ln.strip()
+        if not ln:
+            continue
+
+        # Stop if new section begins
+        if re.search(r"(?i)^(type|chapter)", ln):
+            break
+
+        # Format 1: single letter per line
+        if re.fullmatch(r"[A-Ea-e]", ln):
+            answers.append(ln.lower())
+            continue
+
+        # Format 2: "1. a"
+        m = re.match(r"(\d+)[\.\)]\s*([a-eA-E])", ln)
+        if m:
+            answers.append(m.group(2).lower())
+
+    return answers
 
 
-# ---------- Read numbering.xml ----------
-def get_numbering_xml(doc):
-    for part in doc.part.package.parts:
-        if part.content_type == \
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml":
-            return etree.fromstring(part.blob)
-    return None
+def parse_questions(lines):
+    """Parse MCQ questions + options."""
+    qs = []
+    i = 0
+    qnum = 1
 
-def get_level_format(doc, numId, ilvl):
-    numId = str(numId)
-    xml = get_numbering_xml(doc)
-    if xml is None:
-        return None, None
+    while i < len(lines):
+        ln = lines[i]
 
-    num = xml.find(f".//w:num[@w:numId='{numId}']", namespaces=W_NS)
-    if num is None:
-        return None, None
+        # detect question start
+        if QUESTION_START.search(ln):
+            question_text = ln
 
-    abstract_id = num.find("./w:abstractNumId", namespaces=W_NS)
-    if abstract_id is None:
-        return None, None
-    abs_num_id = abstract_id.get(f"{{{W_NS['w']}}}val")
+            # collect question body (same paragraph)
+            j = i + 1
+            q_lines = []
+            while (
+                j < len(lines)
+                and not QUESTION_START.search(lines[j])
+                and not re.search(r"(?i)^answer\s*key", lines[j])
+            ):
+                if lines[j].strip():
+                    q_lines.append(lines[j].strip())
+                j += 1
 
-    abstract = xml.find(
-        f".//w:abstractNum[@w:abstractNumId='{abs_num_id}']",
-        namespaces=W_NS
-    )
-    if abstract is None:
-        return None, None
+            # question text = first line
+            # options = next 4 lines
+            options = q_lines[:4]
+            options = options + [""] * (4 - len(options))  # pad if needed
 
-    lvl = abstract.find(f"./w:lvl[@w:ilvl='{ilvl}']", namespaces=W_NS)
-    if lvl is None:
-        return None, None
+            qs.append({"number": qnum, "question": question_text, "options": options})
+            qnum += 1
 
-    numFmt = lvl.find("./w:numFmt", namespaces=W_NS)
-    lvlText = lvl.find("./w:lvlText", namespaces=W_NS)
+            i = j
+        else:
+            i += 1
 
-    return (
-        numFmt.get(f"{{{W_NS['w']}}}val") if numFmt is not None else None,
-        lvlText.get(f"{{{W_NS['w']}}}val") if lvlText is not None else None,
-    )
+    return qs
+
+
+def create_output_doc(questions, answers, out_path):
+    doc = Document()
+
+    for q in questions:
+        qnum = q["number"]
+        qtext = q["question"]
+
+        doc.add_paragraph(f"Question {qnum}) {qtext}")
+
+        opts = q["options"]
+        letters = ["a", "b", "c", "d"]
+
+        for letter, opt in zip(letters, opts):
+            doc.add_paragraph(f"{letter}. {opt}")
+
+        if qnum - 1 < len(answers):
+            doc.add_paragraph(f"Answer: {answers[qnum - 1]}")
+        doc.add_paragraph("")
+
+    doc.save(out_path)
 
 
 # extract answers with answer number and questions and options
@@ -107,110 +224,64 @@ def process_docx(path, output_path):
     counters = defaultdict(lambda: defaultdict(int))
     last_level_for_num = defaultdict(lambda: -1)
     for p in doc.paragraphs:
-        text = p.text.strip()
-        # 1️⃣ Check for Word auto-numbering
-        numPr = p._p.pPr.numPr if p._p.pPr is not None else None
-        if numPr is not None:
-            numId = numPr.numId.val
-            ilvl = int(numPr.ilvl.val) if numPr.ilvl is not None else 0
+        p_elm = p._p  # lxml-ish object from python-docx (oxml)
+        numPr = None
+        if p_elm.pPr is not None and p_elm.pPr.numPr is not None:
+            numPr = p_elm.pPr.numPr
 
-            numFmt, lvlText = get_level_format(doc, numId, ilvl)
+        if numPr is None:
+            # non-numbered paragraph
+            lines.append(p.text)
+            # reset last levels? not necessary
+            continue
 
-            # Reset deeper levels
-            for deeper in list(counters[numId]):
+        numId = numPr.numId.val
+        ilvl = int(numPr.ilvl.val) if numPr.ilvl is not None else 0
+
+        # reset counters when jumping to a new higher-level list or when ilvl < last_level
+        if last_level_for_num[numId] == -1 or ilvl <= last_level_for_num[numId]:
+            # when moving to same-or-higher (smaller ilvl number) level, zero-out deeper levels
+            for deeper in list(counters[numId].keys()):
                 if deeper > ilvl:
                     del counters[numId][deeper]
 
-            counters[numId][ilvl] += 1
-            last_level[numId] = ilvl
+        # increment current level counter
+        counters[numId][ilvl] += 1
+        last_level_for_num[numId] = ilvl
 
-            # Create prefix
-            if numFmt == "bullet":
-                prefix = lvlText + " "
+        numFmt, lvlText = get_level_format_from_numId(doc, numId, ilvl)
+
+        if numFmt == "bullet" or (
+            lvlText is not None and "%" not in lvlText and numFmt == "bullet"
+        ):
+            # bullet: lvlText typically contains the bullet glyph
+            prefix = (lvlText or "•") + " "
+        else:
+            # compute actual number/letter/roman
+            val = convert_level_to_number(counters[numId][ilvl], numFmt)
+            if lvlText is None:
+                # fallback: just use decimal
+                prefix = val + ". "
             else:
-                n = counters[numId][ilvl]
-                real = convert_level_to_number(n, numFmt)
-                prefix = lvlText.replace(f"%{ilvl+1}", real) + " "
+                # lvlText contains placeholders like "%1.", "%2)"
+                # replace placeholder corresponding to this level number (levels are 0-based but placeholders are 1-based)
+                placeholder = f"%{ilvl + 1}"
+                prefix = lvlText.replace(placeholder, val) + " "
 
-            lines.append(prefix + text)
-            continue
-        
-        # 2️⃣ Else, check if user manually typed numbering
-        manual = detect_manual_numbering(text)
-        if manual[0]:
-            prefix, rest = manual
-            print(prefix + " " + rest)
-            continue
+        lines.append(prefix + p.text)
 
-        # 3️⃣ Just normal text
-        lines.append(text)
+    # full_text = "\n".join(lines)
+    # input(full_text)
+    answers = parse_answer_key(lines)
+    questions = parse_questions(lines)
 
-    full_text = "\n".join(lines)
-    match = re.search(r"Answer Key", full_text, flags=re.I)
-    if not match:
-        print("No 'Answer Key:' section found.")
-        return
-    else:
-        print("Answer key found.")
-
-    # Split text into before and after answer key
-    answer_key_start = match.start()
-    before = full_text[:answer_key_start]
-    after = full_text[answer_key_start:]
-
-    answers = dict(re.findall(ANSWER_PATTERN, after))
-    answers = {int(k): v.lower() for k, v in answers.items()}
-
-    # If numbering is missing, assign incremental numbers
-    if not answers:
-        raw_answers = re.findall(r"\b[a-eA-E]\b", after)
-        answers = {i + 1: raw_answers[i].lower() for i in range(len(raw_answers))}
-
-    # Split questions
-    question_blocks = re.split(r"\n(?=\d+\.\t)", before)
-    new_doc = Document()
-
-    for block in question_blocks:
-        text = block.strip()
-
-        if not text:
-            continue
-
-        if re.search(MCQ_HEADER_REGEX, text):
-            lines = text.split("\n")
-            qnum_match = re.match(r"(\d+)", lines[0])
-
-            if qnum_match:
-                qnum = int(qnum_match.group(1))
-
-                # Extract question text and options
-                question_text = "\n".join(lines[:5])
-                options = {
-                    "a": lines[-5] if len(lines) >= 5 else "",
-                    "b": lines[-4] if len(lines) >= 4 else "",
-                    "c": lines[-3] if len(lines) >= 3 else "",
-                    "d": lines[-2] if len(lines) >= 2 else "",
-                    "e": lines[-1] if len(lines) >= 1 else "",
-                }
-
-                # add question, options and answers to new document
-                new_doc.add_paragraph(f"Q{qnum}: {question_text}")
-                for opt in ["a", "b", "c", "d", "e"]:
-                    new_doc.add_paragraph(f"{opt}) {options[opt]}")
-
-                if qnum in answers:
-                    new_doc.add_paragraph(f"Answer: {answers[qnum]}")
-                    new_doc.add_paragraph("")
-                else:
-                    new_doc.add_paragraph(text)
-
-            new_doc.save(output_path)
-            print("Document processed and saved.")
+    create_output_doc(questions, answers, output_file)
+    print("Document processed and saved.")
 
 
 if __name__ == "__main__":
     input_file = "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new.docx"
     output_file = (
-        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed.docx"
+        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed2.docx"
     )
     process_docx(input_file, output_file)
