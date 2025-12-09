@@ -3,67 +3,52 @@ import re
 from docx import Document
 from lxml import etree
 
-QUESTION_RE = re.compile(r"(?i)^question\b")
-OPTION_RE = re.compile(r"(?i)^[a-e][\.\)]\s*(.*)")  # a. text  OR  a) text
-ANSWER_RE = re.compile(r"(?i)^answer\s*key")
-ANSWER_ITEM_RE = re.compile(r"(?i)^(\d+)[\.\)]?\s*([a-e])$|^([a-e])$")
+# MCQ question start regex
+QUESTION_START = re.compile(r"(?i)^(question(\s*\d+)?)\b|^\d+[\.\)]")
+
+# Stop headers simplified: just check for 'essay type' or 'true or false' in the line
+STOP_HEADERS_SIMPLE = re.compile(r"(?i)(essay\s*type|true\s*or\s*false)")
 
 W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
 def _get_numbering_part_xml(doc):
-    """
-    Return an lxml element for numbering.xml (the numbering part).
-    """
-    # find the part with numbering content type
     for part in doc.part.package.parts:
         if (
             part.content_type
             == "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
         ):
-            xml_bytes = part.blob  # bytes of numbering.xml
+            xml_bytes = part.blob
             return etree.fromstring(xml_bytes)
     return None
 
 
 def get_level_format_from_numId(doc, numId, ilvl):
-    """
-    Given a Document, numId (string or int) and ilvl (int),
-    return (numFmt, lvlText) or (None, None) if not found.
-
-    numFmt is like 'decimal', 'lowerLetter', 'bullet', ...
-    lvlText is like '%1.', '%2)', '•', etc.
-    """
     numId = str(numId)
     numbering_xml = _get_numbering_part_xml(doc)
     if numbering_xml is None:
         return None, None
 
-    # 1) find the <w:num w:numId="..."> element
     num_xpath = f".//w:num[@w:numId='{numId}']"
     num_elm = numbering_xml.find(num_xpath, namespaces=W_NS)
     if num_elm is None:
         return None, None
 
-    # 2) get abstractNumId (value of <w:abstractNumId w:val="..."/>)
     abs_node = num_elm.find("./w:abstractNumId", namespaces=W_NS)
     if abs_node is None:
         return None, None
     abstract_num_id = abs_node.get(f"{{{W_NS['w']}}}val")
 
-    # 3) find the <w:abstractNum w:abstractNumId="..."> element
     abs_xpath = f".//w:abstractNum[@w:abstractNumId='{abstract_num_id}']"
     abs_elm = numbering_xml.find(abs_xpath, namespaces=W_NS)
     if abs_elm is None:
         return None, None
 
-    # 4) find the <w:lvl w:ilvl="..."> element inside abstractNum
     lvl_xpath = f"./w:lvl[@w:ilvl='{ilvl}']"
     lvl_elm = abs_elm.find(lvl_xpath, namespaces=W_NS)
     if lvl_elm is None:
         return None, None
 
-    # 5) numFmt and lvlText children
     numFmt_elm = lvl_elm.find("./w:numFmt", namespaces=W_NS)
     lvlText_elm = lvl_elm.find("./w:lvlText", namespaces=W_NS)
 
@@ -76,7 +61,6 @@ def get_level_format_from_numId(doc, numId, ilvl):
 
 
 def convert_level_to_number(n, fmt):
-    """Convert 1 → 1, a, i depending on numFormat"""
     if fmt == "decimal":
         return str(n)
     if fmt == "lowerLetter":
@@ -114,56 +98,128 @@ def to_roman(n):
     return res
 
 
-def clean_option(line):
-    """Remove leading a., a) etc."""
-    m = OPTION_RE.match(line.strip())
-    return m.group(1).strip() if m else line.strip()
-
-
 def parse_answer_key(lines):
     answers = []
-    for ln in lines:
-        ln = ln.strip().lower()
-        m = ANSWER_ITEM_RE.match(ln)
-        if not m:
+    start = None
+
+    for i, ln in enumerate(lines):
+        if re.search(r"(?i)^answer\s*key", ln):
+            start = i + 1
+            break
+
+    if start is None:
+        return answers
+
+    for ln in lines[start:]:
+        ln = ln.strip()
+        if not ln:
             continue
-        # Match formats:
-        # 1. a   => m.group(2)
-        # a     => m.group(3)
-        ans = m.group(2) or m.group(3)
-        answers.append(ans)
+
+        # Stop if line contains essay type or true/false
+        if STOP_HEADERS_SIMPLE.search(ln):
+            break
+
+        # Format 1: single letter per line
+        if re.fullmatch(r"[A-Ea-e]", ln):
+            answers.append(ln.lower())
+            continue
+
+        # Format 2: "1. a"
+        m = re.match(r"(\d+)[\.\)]\s*([a-eA-E])", ln)
+        if m:
+            answers.append(m.group(2).lower())
+
     return answers
 
 
-# extract answers with answer number and questions and options
+def parse_questions(lines):
+    qs = []
+    i = 0
+    qnum = 1
+
+    while i < len(lines):
+        ln = lines[i]
+
+        # Stop parsing if essay or true/false section starts
+        if STOP_HEADERS_SIMPLE.search(ln):
+            break
+
+        if QUESTION_START.search(ln):
+            question_text = ln
+            j = i + 1
+            q_lines = []
+            while (
+                j < len(lines)
+                and not QUESTION_START.search(lines[j])
+                and not STOP_HEADERS_SIMPLE.search(lines[j])
+            ):
+                if lines[j].strip():
+                    q_lines.append(lines[j].strip())
+                j += 1
+
+            options = q_lines[:4]
+            options = options + [""] * (4 - len(options))
+            qs.append({"number": qnum, "question": question_text, "options": options})
+            qnum += 1
+            i = j
+        else:
+            i += 1
+
+    return qs
+
+
+def create_output_doc(questions, answers, out_path, remaining_text):
+    doc = Document()
+
+    for q in questions:
+        qnum = q["number"]
+        qtext = q["question"]
+
+        doc.add_paragraph(f"Question {qnum}) {qtext}")
+
+        opts = q["options"]
+        letters = ["a", "b", "c", "d", "e"]
+
+        for letter, opt in zip(letters, opts):
+            doc.add_paragraph(f"{letter}. {opt}")
+
+        if qnum - 1 < len(answers):
+            doc.add_paragraph(f"Answer: {answers[qnum - 1]}")
+        doc.add_paragraph("")
+
+    # Add remaining text (essay, true/false, etc.)
+    if remaining_text:
+        doc.add_page_break()
+        for ln in remaining_text:
+            doc.add_paragraph(ln)
+
+    doc.save(out_path)
+
+
 def process_docx(path, output_path):
     doc = Document(path)
     lines = []
     counters = defaultdict(lambda: defaultdict(int))
     last_level_for_num = defaultdict(lambda: -1)
+
     for p in doc.paragraphs:
-        p_elm = p._p  # lxml-ish object from python-docx (oxml)
+        p_elm = p._p
         numPr = None
         if p_elm.pPr is not None and p_elm.pPr.numPr is not None:
             numPr = p_elm.pPr.numPr
 
         if numPr is None:
-            # non-numbered paragraph
             lines.append(p.text)
-            # reset last levels? not necessary
             continue
 
         numId = numPr.numId.val
         ilvl = int(numPr.ilvl.val) if numPr.ilvl is not None else 0
 
-        # reset counters when jumping to a new higher-level list or when ilvl < last_level
         if last_level_for_num[numId] == -1 or ilvl <= last_level_for_num[numId]:
-            # when moving to same-or-higher (smaller ilvl number) level, zero-out deeper levels
             for deeper in list(counters[numId].keys()):
                 if deeper > ilvl:
                     del counters[numId][deeper]
 
-        # increment current level counter
         counters[numId][ilvl] += 1
         last_level_for_num[numId] = ilvl
 
@@ -172,92 +228,37 @@ def process_docx(path, output_path):
         if numFmt == "bullet" or (
             lvlText is not None and "%" not in lvlText and numFmt == "bullet"
         ):
-            # bullet: lvlText typically contains the bullet glyph
             prefix = (lvlText or "•") + " "
         else:
-            # compute actual number/letter/roman
             val = convert_level_to_number(counters[numId][ilvl], numFmt)
             if lvlText is None:
-                # fallback: just use decimal
                 prefix = val + ". "
             else:
-                # lvlText contains placeholders like "%1.", "%2)"
-                # replace placeholder corresponding to this level number (levels are 0-based but placeholders are 1-based)
                 placeholder = f"%{ilvl + 1}"
                 prefix = lvlText.replace(placeholder, val) + " "
 
         lines.append(prefix + p.text)
 
-    # Split into two sections: questions + answer key
-    try:
-        ak_index = next(i for i, ln in enumerate(lines) if ANSWER_RE.search(ln))
-    except StopIteration:
-        raise ValueError("Answer key not found")
+    # Remaining text: everything after first line containing essay type or true/false
+    remaining_index = None
+    for i, ln in enumerate(lines):
+        if STOP_HEADERS_SIMPLE.search(ln):
+            remaining_index = i
+            break
+    remaining_text = lines[remaining_index:] if remaining_index is not None else []
 
-    question_lines = lines[:ak_index]
-    answer_lines = lines[ak_index + 1 :]
+    # Parse only MCQs before essay/true-false
+    parse_until = remaining_index if remaining_index is not None else len(lines)
+    answers = parse_answer_key(lines[:parse_until])
+    questions = parse_questions(lines[:parse_until])
 
-    # Parse answer key
-    answers = parse_answer_key(answer_lines)
-
-    # Parse questions
-    formatted_questions = []
-    current_q = None
-    current_opts = []
-
-    for ln in question_lines:
-        if not ln.strip():
-            continue
-
-        # New question starts
-        if QUESTION_RE.search(ln):
-            if current_q:
-                # store previous question
-                formatted_questions.append((current_q, current_opts))
-            current_q = ln
-            current_opts = []
-            continue
-
-        # Option line (a., b., c., etc.)
-        if OPTION_RE.match(ln):
-            current_opts.append(clean_option(ln))
-            continue
-
-        # Option line without labels
-        if current_q:
-            current_opts.append(ln.strip())
-
-    # Store last block
-    if current_q:
-        formatted_questions.append((current_q, current_opts))
-
-    # Build output doc
-    out = Document()
-
-    for i, (qtext, opts) in enumerate(formatted_questions, start=1):
-        # Clean question text: remove "Question ..."
-        qtext_clean = re.sub(r"(?i)^question\b[\s:\-\d\.]*", "", qtext).strip()
-
-        out.add_paragraph(f"Question {i}) {qtext_clean}")
-
-        # Only take first 4 or 5 options
-        opts = opts[:5]
-
-        labels = ["a", "b", "c", "d", "e"]
-        for label, opt in zip(labels, opts):
-            out.add_paragraph(f"{label}. {opt}")
-
-        # Add answer
-        if i <= len(answers):
-            out.add_paragraph(f"Answer: {answers[i - 1]}")
-        out.add_paragraph("")
-
-    out.save(output_path)
+    create_output_doc(questions, answers, output_path, remaining_text)
+    print("Document processed and saved.")
 
 
 if __name__ == "__main__":
     input_file = "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new.docx"
     output_file = (
-        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed4.docx"
+        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed_new.docx"
     )
     process_docx(input_file, output_file)
