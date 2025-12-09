@@ -163,8 +163,7 @@ def parse_answer_key(lines):
 def parse_questions(lines):
     """
     Parse MCQs from the lines list.
-    Stop entirely when a NON_MCQ_SECTION line is encountered.
-    Treat numbered lines (1.,2.) as options if we currently have an open question.
+    Adds support for UNNUMBERED options (plain text lines).
     """
     qs = []
     current = None
@@ -172,89 +171,75 @@ def parse_questions(lines):
 
     i = 0
     while i < len(lines):
-        ln = lines[i]
+        ln = lines[i].strip()
 
-        # If we reach essay/true-false, stop parsing questions completely
+        # Stop when non-MCQ or answer key starts
         if NON_MCQ_SECTION.search(ln) or re.search(r"(?i)^answer\s*key", ln):
             break
 
-        # If line starts a question (QUESTION_START) and we don't already treat it as an option
+        # Regex detections
         qstart_match = QUESTION_START.search(ln)
         opt_num_match = OPTION_NUMERIC.match(ln)
         opt_letter_match = OPTION_LETTER.match(ln)
+        plain_match = PLAIN_LINE.match(ln)
 
-        # If we currently have an open question:
         if current:
-            # If this line is a numeric option or letter option → append as option
+            # Case 1 — numeric option like “1. Ghk”
             if opt_num_match:
                 current["options"].append(clean_option_text(ln))
                 i += 1
                 continue
+
+            # Case 2 — letter option “a. Ghk”
             if opt_letter_match:
                 current["options"].append(clean_option_text(ln))
                 i += 1
                 continue
 
-            # If line looks like a new question start (and not an option) → close current
+            # Case 3 — UNNUMBERED option (bare line)
+            # Accept only if it’s a stand-alone text line and not a new question
+            if (
+                plain_match
+                and not qstart_match  # not a new question
+                and ln.lower()
+                not in ["a", "b", "c", "d", "e"]  # avoid one-letter weirdness
+                and len(current["options"]) < 5  # avoid absorbing essay content
+            ):
+                current["options"].append(ln.strip())
+                i += 1
+                continue
+
+            # Case 4 — new question encountered → close current
             if qstart_match:
                 qs.append(current)
                 current = None
-                # do not advance here, let the next iteration start this new question
                 continue
 
-            # Otherwise it's a continuation of question text or continuation of last option
-            if current["options"]:
-                # continuation of last option
-                current["options"][-1] = (
-                    current["options"][-1] + " " + ln.strip()
-                ).strip()
+            # Case 5 — continuation paragraph (attach to question text)
+            if not current["options"]:
+                current["question"] += " " + ln
             else:
-                # continuation of question text
-                current["question"] = (current["question"] + " " + ln.strip()).strip()
+                # continuation of last option
+                current["options"][-1] += " " + ln
+
             i += 1
             continue
 
-        # If no current question:
+        # No current question open:
         if qstart_match:
-            # But if the match is a numeric line and actually is an option-ish (rare here),
-            # we only start a question if the line has significant text (QUESTION_START regex ensures that).
-            current = {"number": qnum, "question": ln.strip(), "options": []}
+            current = {"number": qnum, "question": ln, "options": []}
             qnum += 1
             i += 1
             continue
 
-        # If this line matches an option but we have no current question, it's ambiguous:
-        # treat it as part of previous question only if there is a previous question in qs.
-        if opt_num_match or opt_letter_match:
-            if qs:
-                # append to last question's options
-                last = qs[-1]
-                last_opts = last.get("options", [])
-                last_opts.append(clean_option_text(ln))
-                last["options"] = last_opts
-            else:
-                # no question to attach to — ignore or create a dummy question? we'll create a small placeholder
-                current = {
-                    "number": qnum,
-                    "question": "",
-                    "options": [clean_option_text(ln)],
-                }
-                qnum += 1
-            i += 1
-            continue
-
-        # Otherwise skip stray lines
         i += 1
 
-    # append last open question
     if current:
         qs.append(current)
 
-    # Normalize options list to always have 5 slots (a-e)
+    # Fill missing options up to 5
     for q in qs:
-        opts = q.get("options", [])
-        # remove empty options that are empty strings
-        opts = [o for o in opts]
+        opts = q["options"]
         while len(opts) < 5:
             opts.append("")
         q["options"] = opts[:5]
@@ -372,6 +357,6 @@ def process_docx(path, output_path):
 if __name__ == "__main__":
     input_file = "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new.docx"
     output_file = (
-        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed13.docx"
+        "C:\\Users\\nikhi\\OneDrive\\Desktop\\Scripts\\test_new_processed15.docx"
     )
     process_docx(input_file, output_file)
